@@ -1,0 +1,539 @@
+//Constants
+const wakeupTime = 0.1;
+const measureTime = 150;
+micBufFactor <- 5;
+sampleRate <- 1/wakeupTime
+s_measureNum <- measureTime * sampleRate;
+//m_measureNum <- measureTime / micBufFactor;
+micSampleRate <- 1000;
+micBuffer1 <- blob(micSampleRate*2*micBufFactor);
+micBuffer2 <- blob(micSampleRate*2*micBufFactor);
+
+//Global Variables
+debug <- 0;
+log <- 0;
+scnt <- 0;
+mcnt <- 0;
+sensor_values10 <- [];
+//Sample counter
+sampleCounter <- 0;
+
+device_id <- hardware.getdeviceid();
+
+// Device control I2C
+FireImp_I2C <- hardware.i2c89;
+
+mic_pin <- hardware.pin1;
+
+// Configure hardware
+// analog inputs read a value between 0 (for 0 V) and 65,535 (16-bit ADC) for the imp's supply voltage (<3.3V)
+
+function bit_value(bit){
+    return (1 << bit);
+}
+
+function motionSensorRead(){
+    // the GPIO to read the Motion sensor
+	local read_val=FireImp_I2C.read(gpio_addr, format("%c", gpio_reg_gpio),1);
+	// bit mask only the motion bit
+	local motion_data=(read_val[0] & 0x20)>>5;
+	//server.log(format("Motion: %d",motion_data));
+	// return the value;
+	return motion_data;
+}
+
+function readRSSI(){
+	return imp.rssi();
+}
+
+function readInternalVoltage(){
+	return hardware.voltage();
+}
+ 
+//Pressure Module
+pressure_module_address_write <- 0xEE;
+pressure_module_address_read <- 0xEF;
+pressure_control_register_address <- 0xf4;
+pressure_control_register_value_temperature_start <- 0x2e;
+pressure_control_register_value_MSB <- 0xF6;
+pressure_control_register_value_LSB <- 0xF7;
+pressure_control_register_value_XLSB <- 0xF8;
+
+//Pressure resolution vs power settings
+pressure_control_register_value <- 0x34;
+pressure_ultra_low_power_oversampling_setting <- 0;
+pressure_standard_resolution_oversampling_setting <- 1;
+pressure_high_resolution_oversampling_setting <- 2;
+pressure_ultra_high_resolution_oversampling_setting <- 3;
+//Select one of the four pressure settings for the pressureRead() function
+pressure_oversampling_setting <- pressure_high_resolution_oversampling_setting;
+pressure_control_register_value_start <- (pressure_control_register_value) + (pressure_oversampling_setting<<6); 
+
+pressure_ultra_low_power_conv_time <- 0.0045; // 4.5 ms
+pressure_standard_resolution_conv_time <- 0.008; //ms
+pressure_high_resolution_conv_time <- 0.014; //ms 
+pressure_ultra_high_resolution_conv_time <- 0.026; //ms
+pressure_conv_time <- pressure_high_resolution_conv_time; //Select 1 of the 4
+
+pressure_bytes_convert <- 3;
+
+pressure_calibration_AC1_MSB_addr <- 0xAA;
+pressure_calibration_AC4_MSB_addr <- 0xB0;
+pressure_calibration_AC5_MSB_addr <- 0xB2;
+pressure_calibration_AC6_MSB_addr <- 0xB4;
+pressure_calibration_MD_MSB_addr <- 0xBE;
+
+AC1 <- 0;
+AC2 <- 0;
+AC3 <- 0;
+AC4 <- 0;
+AC5 <- 0;
+AC6 <- 0;
+B1 <- 0;
+B2 <- 0;
+B5 <- 0;
+MB <- 0;
+MC <- 0;
+MD <- 0;
+calibration_array <- [];
+
+function correct_signed_representation_calibration_constants(arry){
+    if(arry[0] & 0x80){
+        return (arry[0]<<8) + arry[1] + 0xFFFF0000;
+    }
+    else{
+        return (arry[0]<<8) + arry[1];
+    }
+}
+
+function correct_unsigned_representation_calibration_constants(arry){
+    local value = (arry[0]<<8) + arry[1];
+    return value;
+}
+
+function correct_unsigned_representation_pressure(arry){
+    //The datasheet is wrong, the return type of the uncompensated pressure value is an unsigned long
+    return (arry[0]<<16) + (arry[1]<<8) + arry[2];
+}
+
+function bmp085_get_cal_params(){
+    calibration_array.clear();
+    local temp_array = [];
+    local is_i2c_available_flag = 0;
+    imp.sleep(0.1);
+    for(local i = pressure_calibration_AC1_MSB_addr; i <= pressure_calibration_MD_MSB_addr; i+=2){
+        
+        if(FireImp_I2C.write(pressure_module_address_write, format("%c", i)) == 0){
+            is_i2c_available_flag = 1;
+        }
+        else{
+            if(log){
+              server.log("I2C device (pressure) not responding...");
+            }
+            is_i2c_available_flag = 0;
+        }
+        if(is_i2c_available_flag){
+            temp_array = FireImp_I2C.read(pressure_module_address_read, "", 2);
+            if((i == pressure_calibration_AC4_MSB_addr) || (i == pressure_calibration_AC5_MSB_addr) || (i == pressure_calibration_AC6_MSB_addr)){
+                calibration_array.push(correct_unsigned_representation_calibration_constants(temp_array));    
+            }
+            else{
+                calibration_array.push(correct_signed_representation_calibration_constants(temp_array));
+            }            
+        }
+    }
+    if(is_i2c_available_flag){
+        AC1 = calibration_array[1-1];
+        AC2 = calibration_array[2-1]; 
+        AC3 = calibration_array[3-1]; 
+        AC4 = calibration_array[4-1];
+        AC5 = calibration_array[5-1];
+        AC6 = calibration_array[6-1];
+        B1 =  calibration_array[7-1];
+        B2 =  calibration_array[8-1];
+        MB =  calibration_array[9-1];
+        MC = calibration_array[10-1];
+        MD = calibration_array[11-1];
+        
+        if(debug){
+            server.log(format("AC1: %d", AC1));
+            server.log(format("AC2: %d", AC2));
+            server.log(format("AC3: %d", AC3));
+            server.log(format("AC4: %d", AC4));
+            server.log(format("AC5: %d", AC5));
+            server.log(format("AC6: %d", AC6));
+            server.log(format("B1: %d", B1));
+            server.log(format("B2: %d", B2));
+            server.log(format("MB: %d", MB));
+            server.log(format("MC: %d", MC));
+            server.log(format("MD: %d", MD));
+        }
+    }
+    else{
+        if(log){
+            server.log("I2C pressure not responding...");
+        }
+    }
+}
+
+function temperatureRead(){
+    if(FireImp_I2C.write(pressure_module_address_write, format("%c%c", pressure_control_register_address, pressure_control_register_value_temperature_start)) == 0){
+		// sleep for 5 ms
+        imp.sleep(0.005);
+        local UT_array = FireImp_I2C.read(pressure_module_address_read, format("%c",pressure_control_register_value_MSB), 2);
+        local UT = correct_signed_representation_calibration_constants(UT_array);
+        local X1 = ((UT - AC6) * AC5) >> 15;    
+        local X2 = (MC << 11) / (X1 + MD);
+        B5 = X1 + X2;
+        local T = (B5 + 8) >> 4;
+        if(debug){
+            server.log(format("UT: %d", UT));
+            server.log(format("X1: %d", X1));
+            server.log(format("X2: %d", X2));
+            server.log(format("B5: %d", B5));
+            server.log(format("T: %d", T));
+        }
+        local C = T / 10.0;
+        local F = C * (9.0/5.0) + 32;
+        //agent.send("sendTemperatureToOpenSense", F);
+        //server.log(format("Temperature: %3.1f%c%cF", F, 0xC2,0xB0));
+		return F;
+    }
+    else{
+        server.log("I2C temperature sensor not responding...");
+		return 0;
+    }
+} 
+
+function pressureRead(){
+    local UP = 0;
+    if(FireImp_I2C.write(pressure_module_address_write, format("%c", pressure_control_register_address) + pressure_control_register_value_start) == 0){
+        imp.sleep(pressure_conv_time);
+        local temp_array = FireImp_I2C.read(pressure_module_address_read, format("%c",pressure_control_register_value_MSB), pressure_bytes_convert);     
+        UP = (correct_unsigned_representation_pressure(temp_array));    
+        UP = (correct_unsigned_representation_pressure(temp_array)) >> (8-pressure_oversampling_setting);    
+        
+        local B6 = B5 - 4000;
+        local X1_2 = (B2 * ((B6 * B6)>>12))>>11;
+        local X2_2 = (AC2 * B6) >> 11;
+        local X3_2 = X1_2 + X2_2;
+        local B3_1 = ((((AC1 * 4) + X3_2) << pressure_oversampling_setting) + 2) >> 2;
+        local X1_3 = (AC3 * B6) >> 13;
+        local X2_3 = (B1*((B6*B6)>>12))>>16;
+        local X3_3 = ((X1_3 + X2_3)+2) >> 2;
+        local B4 = (AC4 * (X3_3 + 32768)) >> 15;
+        local B7 = (UP - B3_1) * (50000 >> pressure_oversampling_setting);
+        local p_1;
+        if(B7 < 0x80000000){
+            p_1 = (B7 * 2) / B4;
+        }
+        else{
+            p_1 = (B7 / B4) * 2;
+        }
+        local X1_4 = (p_1 >> 8) * (p_1 >> 8);
+        local X1_5 = (X1_4 * 3038) >> 16;
+        local X2_4 = (-7357 * p_1) >> 16;
+        local pressure_pascals = p_1 + ((X1_5 + X2_4 + 3791) >> 4);  
+        local pressure_inHg = pressure_pascals * 0.000295299830714;
+        //server.log(format("Pressure: %d (Pascals)", pressure_pascals));
+        //server.log(format("Pressure: %3.3f (inHg)", pressure_inHg ));
+        if(debug){
+            server.log("BEGIN PRESSURE DEBUG");
+            server.log(format("0: %d, 1: %d, 2: %d", temp_array[0], temp_array[1], temp_array[2]));
+            server.log(format("UP %d", UP));
+            server.log(format("expecting pressure of %d, got %d", 101592, p_2));
+            server.log(format("B6: %d", B6));
+            server.log(format("X1_2: %d", X1_2));
+            server.log(format("X2_2: %d", X2_2));
+            server.log(format("X3_2: %d", X3_2));
+            server.log(format("B3_1: %d", B3_1));
+            server.log(format("X1_3: %d", X1_3));
+            server.log(format("X2_3: %d", X2_3));
+            server.log(format("X3_3: %d", X3_3));
+            server.log(format("B4: %d", B4));
+            server.log(format("B7: %d", B7));    
+            server.log(format("X1_4: %d", X1_4));
+            server.log(format("p_1: %d", p_1));
+            server.log(format("X1_5: %d", X1_5));
+            server.log(format("X2_4: %d", X2_4));
+            server.log(format("p_2: %d", p_2));
+        }
+		return pressure_pascals;
+    }
+    else{
+        server.log("I2C Pressure sensor not responding");
+		return 0;
+    }
+}
+ 
+// I2C Interface to TI's ADC128D818
+// Pin 1 is SCL
+// Pin 2 is SDA
+// set the I2C clock speed. We can do 10 kHz, 50 kHz, 100 kHz, or 400 kHz
+// Max is 400kHz, min is 10Khz
+FireImp_I2C.configure(CLOCK_SPEED_400_KHZ);
+// The slave address for this device is set in hardware (pins A0 and A1 for ADC128D818)
+adc_serial_bus_addr <- 0x1D;
+adc_serial_bus_addr_write <- 0x3B;
+adc_serial_bus_addr_read <- 0x3A;
+busy_status_register <- 0x0C;
+not_ready_bit_for_busy_status_register <- 1;
+channel_disable_register <- 0x08;
+configuration_register <- 0x00;
+adv_config_register <- 0x0B;
+adv_config_value <- 0x01;
+adc_start_bit_for_configuration_register <- 0;
+//Default settings
+//2.56V internal VREF
+//Mode 0
+//Low Power Conversion Mode
+
+//Channel Readings Registers
+sense_zout <- 0x27;
+sense_yout <- 0x25;
+sense_xout <- 0x26;
+sense_humidity <- 0x22;
+sense_light <- 0x23;
+sense_temp <- 0x21;
+
+
+class AdcSensor {
+    constructor(my_adc_register, my_agent_text)
+    {
+    	adc_register = my_adc_register;
+        agent_text = my_agent_text;
+	}
+	adc_register = null;
+    agent_text = null;
+    function read_and_send_bytes(){
+        if(FireImp_I2C.write(adc_serial_bus_addr_write, format("%c", adc_register)) == 0){
+            local result = FireImp_I2C.read(adc_serial_bus_addr_read, format("%c", adc_register), 2);
+            local converted_result = ((result[0]<<8) + result[1]);
+            //server.log(format("I2C write successful for adc_register: 0x%x with read result: %u", adc_register, converted_result));
+			return converted_result;
+        }
+        else{
+            server.log("I2C ADC128D818 read unsuccessful");
+			return 0;
+        }
+    }
+}
+
+acc_x_adc <- AdcSensor(sense_xout, "sendXAccelerationToOpenSense");
+acc_y_adc <- AdcSensor(sense_yout, "sendYAccelerationToOpenSense");
+acc_z_adc <- AdcSensor(sense_zout, "sendZAccelerationToOpenSense");
+humidity_adc <- AdcSensor(sense_humidity, "sendHumidityToOpenSense");
+light_adc <- AdcSensor(sense_light, "sendLightToOpenSense");
+temp_adc <- AdcSensor(sense_temp, "sendLightToOpenSense");
+
+function not_ready(){
+    if(FireImp_I2C.write(adc_serial_bus_addr_write, format("%c", busy_status_register)) == 0){
+        local not_ready = FireImp_I2C.read(adc_serial_bus_addr_read, format("%c", busy_status_register), 1);
+        if((not_ready[0] & bit_value(not_ready_bit_for_busy_status_register))>>not_ready_bit_for_busy_status_register){
+            return true;
+        }
+        else{
+            imp.sleep(0.01);
+            return false;
+        }        
+    }
+    else{
+        imp.sleep(0.01);
+    }
+    imp.sleep(0.01);
+    return true; 
+}
+
+function micSamplerInit(){
+    hardware.sampler.configure(mic_pin, micSampleRate, 
+    [micBuffer1, micBuffer2], micSamplesReady);
+    // Start sampling
+    hardware.sampler.start();
+    server.log("mic sample rate: " + hardware.sampler.getsampleratehz() + "Hz");
+    imp.wakeup(measureTime, stopMicSampler);
+}
+
+function stopMicSampler() {
+    server.log("mic sampling done");
+    hardware.sampler.stop();
+}
+
+function micSamplesReady(buf, length) {
+    //mcnt++;
+    if (length > 0) {
+        agent.send("micBufferFull", buf);
+        server.log("Buffer processed of length " + length + " bytes");
+    } else {
+        server.error("Overrun");
+    }
+    /*
+    if(mcnt >= m_measureNum) {
+        stopMicSampler
+    }
+    */
+}
+
+
+
+
+function adcInit(){
+    while(not_ready());
+    //Disable INX and temperature
+    local in0_bit = 0;
+    local in5_bit = 5;
+    local in6_bit = 6;    
+    local adc_internal_temperature_bit = 7;
+    local adc_initialize_bit = 7;
+    local initialize_all = bit_value(adc_initialize_bit)
+    local disable_data = bit_value(in0_bit) | bit_value(in5_bit) | bit_value(in6_bit) | bit_value(adc_internal_temperature_bit);
+    if(FireImp_I2C.write(adc_serial_bus_addr_write, format("%c", configuration_register) + initialize_all) == 0){
+        server.log("ADC Initialize ok");
+    }
+    else{
+        server.log("ADC Initialization failed");
+    }
+    if(FireImp_I2C.write(adc_serial_bus_addr_write, format("%c", adv_config_register) + adv_config_value) == 0){
+    	server.log("ADC Config Set");
+    }else{
+    	server.log("ADC Config failed to set");
+    }  
+    //Start ADC
+    if(FireImp_I2C.write(adc_serial_bus_addr_write, format("%c", configuration_register) + bit_value(adc_start_bit_for_configuration_register)) == 0){
+        server.log("Starting ADC...");
+    }
+    else{
+       server.log("Unable to start I2C on ADC128D818"); 
+    }
+}
+ 
+function takeReadings(){
+//    while(scnt < s_measureNum) {
+        local mt_val=motionSensorRead();
+        local rssi_val=readRSSI();
+        bmp085_get_cal_params();
+        local tmp_val=temperatureRead();
+        local pres_val=pressureRead();
+        local vol_val=readInternalVoltage();
+	    local x_val=acc_x_adc.read_and_send_bytes();
+	    local y_val=acc_y_adc.read_and_send_bytes(); 
+	    local z_val=acc_z_adc.read_and_send_bytes();
+	    local hum_val=humidity_adc.read_and_send_bytes(); 
+	    local ll_val=light_adc.read_and_send_bytes();
+	    //server.log(format("Mot: %d, Tmp: %3.3f, Pres: %d, X: %u, Y: %u, Z: %u, Hum: %u, Light: %u, Rssi: %d, Volt: %f",
+	    //           mt_val,tmp_val,pres_val,x_val,y_val,z_val,hum_val,ll_val,rssi_val,vol_val));
+	    sensor_values <- {
+            acc_x= x_val,
+            acc_y= y_val,
+            acc_z= z_val,
+            motion = mt_val,
+            digital_temp= tmp_val,
+            light= ll_val,
+            pressure = pres_val,
+		    humid = hum_val,
+            timestamp = hardware.millis().tointeger(),
+		    //rssi = rssi_val,
+		    //voltage = vol_val,
+            id = device_id.tostring()
+        };
+	    //agent.send("postJSON", sensor_values);
+ 	    scnt++;
+ 	    sensor_values10.append(sensor_values); 
+ 	    if(scnt%sampleRate == 0) {
+ 	        server.log(scnt);
+ 	        agent.send("postJSON", sensor_values10);
+ 	        sensor_values10.clear();
+ 	    }
+ 	    //imp.sleep(0.01); 
+//    }
+   	if(scnt < s_measureNum) {
+           imp.wakeup(wakeupTime, takeReadings);
+   	}
+}
+
+// Functions for I2C GPIO controller
+// I2C addr
+gpio_addr <- 0x40;
+gpio_addr_write <- 0x40;
+gpio_addr_read <- 0x41;
+// device register
+gpio_reg_iodir <- 0x00; // IO direction
+gpio_reg_iodirval <- 0x20; // All but pin 5 are output
+gpio_reg_ipol <- 0x01;
+gpio_reg_gpinten <- 0x02;
+gpio_reg_defval <- 0x03;
+gpio_reg_intcon <- 0x04;
+gpio_reg_iocon <- 0x05;
+gpio_reg_gppu <- 0x06; // Pullup resist setup
+gpio_reg_gppuval <- 0x00; // Set the pull up on pin 7
+gpio_reg_intf <- 0x07;
+gpio_reg_intcap <- 0x08;
+gpio_reg_gpio <- 0x09; // Port values
+gpio_reg_olat <- 0x0A; // Write directly to output
+
+// The state of the sensor board
+senser_pwr_state <- 1;
+
+function gpioInit(){
+	// setup the IO dir
+	if (FireImp_I2C.write(gpio_addr, format("%c%c",gpio_reg_iodir,gpio_reg_iodirval))==0){
+		server.log("GPIO setup io dir");
+	}else{
+		server.log("GPIO unable to setup io dir");
+	}
+	// setup the pull up
+	if (FireImp_I2C.write(gpio_addr, format("%c%c",gpio_reg_gppu,gpio_reg_gppuval))==0){
+		server.log("GPIO setup pull-up res");
+	}else{
+		server.log("GPIO unable to setup pull-up res");
+	}
+	// write to port
+	local gpio_val = 0xff;
+	if (FireImp_I2C.write(gpio_addr, format("%c%c",gpio_reg_gpio,gpio_val))==0){
+		server.log("GPIO setup port value");
+	}else{
+		server.log("GPIO unable to setup port value");
+	}
+}
+
+function gpio_test(){
+    local read_val=FireImp_I2C.read(gpio_addr, format("%c", gpio_reg_gpio),1);
+    server.log(format("GPIO value: %x", read_val[0]));
+    read_val=FireImp_I2C.read(gpio_addr, format("%c", gpio_reg_iodir),1);
+    server.log(format("IO Dir: %x",read_val[0]));
+    read_val=FireImp_I2C.read(gpio_addr, format("%c", gpio_reg_gppu),1);
+    server.log(format("Pullup: %x",read_val[0]));
+    imp.wakeup(wakeupTime, gpio_test);
+}
+
+
+// Functions related to the SPI devices
+SRAM_SSN_ID <- 4;
+SSN_NO_DEV <- 5;
+function spi_set_ss(ss_id){
+	local gpio_val = 0x7F;
+	if (ss_id==0){
+		// select device 0
+		gpio_val = 0x7D;
+	}else if (ss_id==1){
+		// select device 1
+		gpio_val = 0x77;
+	}else if (ss_id==2){
+		// select device 2
+		gpio_val = 0x6F;
+	}else if (ss_id==3){
+		// select device 3
+		gpio_val = 0x7E;
+	}else if (ss_id==4){
+		// select SRAM
+		gpio_val = 0x3F;
+	}
+	FireImp_I2C.write(gpio_addr, format("%c%c",gpio_reg_gpio,gpio_val));
+}
+ 
+server.log("Running...");
+
+bmp085_get_cal_params();
+adcInit();
+gpioInit();
+//micSamplerInit();
+takeReadings();

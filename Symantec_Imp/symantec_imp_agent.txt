@@ -1,0 +1,18 @@
+const REMOTE_URL = "http://ec2-52-23-228-130.compute-1.amazonaws.com:8080/add";
+const REMOTE_URL_MIC = "http://ec2-54-174-126-248.compute-1.amazonaws.com:8080/microphone";
+DEBUG <- true;
+
+function onHttpComplete(m)
+{
+    if (DEBUG) server.log("http request sent , status was " + m.statuscode);
+}
+
+device.on("postJSON", function (x) {
+    if (DEBUG) server.log("post json to server " + http.jsonencode(x));
+    http.post(REMOTE_URL,{"Content-Type":"application/json"},http.jsonencode(x)).sendasync(onHttpComplete);
+});
+
+device.on("micBufferFull", function (buf) {
+    if (DEBUG) server.log(buf.tostring());
+    http.post(REMOTE_URL_MIC,{"Content-Type":"application/json"}, http.jsonencode(http.base64encode(buf))).sendasync(onHttpComplete);
+});
