@@ -1,0 +1,11 @@
+Coffee Machine
+1-HC
+2-Coffeew/Cream
+3-HC
+4-HC
+5-HC
+6-Coffee(2)
+7-HC
+8-Water 2
+9-HC
+10-Water
